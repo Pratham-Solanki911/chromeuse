@@ -1,0 +1,7 @@
+node_modules/
+native-host.cmd
+native-host.sh
+native-host.json
+*.token
+*.log
+.DS_Store

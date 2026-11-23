@@ -1,0 +1,18 @@
+{
+  "name": "chrome-use",
+  "version": "1.1.0",
+  "type": "module",
+  "description": "ChromeUse — Universal zero-prompt Chrome Extension + MCP connector for Antigravity, Claude, GPT, Cursor, and any MCP model",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Pratham-Solanki911/chromeuse.git"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "setup": "node mcp-server.mjs --install",
+    "start": "node mcp-server.mjs",
+    "test": "node mcp-server.mjs --self-test"
+  }
+}
