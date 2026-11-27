@@ -15,6 +15,8 @@
 - **No Debugger Infobar on Everyday Actions:** Uses `chrome.tabs`, `chrome.scripting` (`ISOLATED` world), `chrome.cookies`, passive `chrome.webRequest`, and `captureVisibleTab` by default. Your untouched personal tabs run **zero** injected scripts and trigger zero anti-bot/CSP mutations.
 - **Zero `npm` Dependencies (`~25ms` Cold Start):** Runs directly on Node.js 20+ standard library (`node:http`, `node:net`, `node:crypto`, `node:fs`) — no `npx` lag, no `node_modules` bloat.
 - **Multi-Client Leader / Peer Relay:** Multiple Antigravity windows, Claude Code, and Cursor can all talk to the same Chrome instance simultaneously without port conflicts.
+- **Automatic `"AI Agent"` Tab Grouping & Cleanup:** Tabs opened or operated on by an agent (plus child OAuth/popup tabs) are automatically grouped into a cyan **`AI Agent`** Chrome Tab Group so you never click an agent's tab by mistake — and agents are instructed to close their tabs (`close` / `close_agent_tabs`) as soon as they finish.
+- **Human Co-Pilot Awareness (Anti-Double-Submit & Anti-Reopen):** Detects real human (`isTrusted`) form fills, clicks, submits, component updates, and post-submit tab closures on agent tabs (without logging raw passwords/text). If you manually submit a form and the tab closes or advances, the agent gets `[USER_COMPLETED_AND_TAB_CLOSED]` / `[USER_INTERACTION_DETECTED]` instead of mistaking it for a crash, re-opening the tab, or injecting into the wrong input box.
 - **One-Click Hardware-Style Kill Switch:** Headless toolbar badge shows green **`ON`** when active; click the toolbar icon once to toggle amber **`OFF`** and instantly sever control.
 
 ---
@@ -67,7 +69,7 @@ Add `chrome-use` to `~/.gemini/config/mcp_config.json` (Antigravity) or your MCP
 
 | Tool | Read-Only | Purpose |
 | :--- | :---: | :--- |
-| `tabs` | No | List open tabs (`*` marks active), open new tabs, switch focus, close, reload, go back/forward, or group tabs. `tabId` is optional on all other tools. |
+| `tabs` | No | List open tabs (`*` marks active, `[AI Agent]` marks grouped agent tabs), open new tabs, switch focus, `close`, `close_agent_tabs`, reload, go back/forward, or group tabs. |
 | `navigate` | No | Navigate active/target/new tab to a URL, wait for load, and immediately return an interactive `[ref_N]` snapshot in one round-trip. |
 | `read_page` | Yes | Token-efficient accessibility + DOM outline with stable `[ref_N]` IDs (`interactive`, `full`, or clean `markdown` extraction). Pierces open Shadow DOM & iframes without mutating page DOM attributes. |
 | `find` | Yes | Fast semantic, label, placeholder, role, or CSS selector search across the page returning matching `[ref_N]` IDs and coordinates. |

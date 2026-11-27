@@ -1,10 +1,11 @@
 // Injected on-demand into Chrome's ISOLATED world (never touches page's MAIN window globals or mutates DOM attributes on read).
 (() => {
-  if (globalThis.__cext && globalThis.__cext.version === 1) return;
+  if (globalThis.__cext && globalThis.__cext.version >= 2) return;
 
   const refMap = new Map(); // key -> { weak: WeakRef<Element>, selector, tag, role, name, bbox }
   const elemToRef = new WeakMap();
   let nextId = 1;
+  let agentBusyDepth = 0;
 
   const INTERACTIVE_TAGS = new Set(["a", "button", "input", "textarea", "select", "summary", "details", "option"]);
   const INTERACTIVE_ROLES = new Set([
@@ -954,18 +955,219 @@
     return { text: `Attached ${files.length} file(s) to <input type="file">: ${files.map((f) => f.name).join(", ")}` };
   }
 
+  // ---- Real Human Interaction & Component-Update Observer (isTrusted === true only) ----
+  const SUBMIT_RE = /\b(submit|send|save|confirm|continue|next|done|finish|sign\s*in|log\s*in|login|verify|apply|ok|pay|complete|post|create|update|approve)\b/i;
+  let mutationWatch = null;
+
+  function emitUserActivity(payload) {
+    try {
+      chrome.runtime?.sendMessage?.({
+        type: "cext_user_activity",
+        url: location.href,
+        title: document.title || "",
+        ts: Date.now(),
+        ...payload
+      })?.catch?.(() => {});
+    } catch {}
+  }
+
+  function findNearestInteractive(startNode) {
+    let cur = startNode && startNode.nodeType === 1 ? startNode : startNode?.parentElement;
+    for (let hop = 0; cur && hop < 6; hop++) {
+      if (isInteractive(cur)) return cur;
+      cur = cur.parentElement || cur.getRootNode?.()?.host || null;
+    }
+    return null;
+  }
+
+  function summarizeInputSafe(el) {
+    const tag = el.tagName.toLowerCase();
+    if (tag === "select") {
+      const txt = cleanText(el.selectedOptions?.[0]?.text || el.value || "", 45);
+      return `selected "${txt}"`;
+    }
+    if (tag === "input") {
+      const t = (el.getAttribute("type") || "text").toLowerCase();
+      if (t === "checkbox" || t === "radio") return el.checked ? "checked" : "unchecked";
+      if (t === "file") return `${el.files?.length || 0} file(s)`;
+      return `(${(el.value || "").length} chars)`;
+    }
+    if (el.isContentEditable) {
+      return `(${(el.innerText || el.textContent || "").trim().length} chars)`;
+    }
+    return `(${(el.value || "").length} chars)`;
+  }
+
+  function armPostUserMutationCheck(pendingCustomClick = "") {
+    if (mutationWatch) {
+      if (pendingCustomClick && !mutationWatch.pendingCustomClick) {
+        mutationWatch.pendingCustomClick = pendingCustomClick;
+      }
+      return;
+    }
+
+    const startUrl = location.href;
+    let addedNodes = 0;
+    let removedNodes = 0;
+    let dialogOrFormChanged = false;
+    let settleTimer = null;
+
+    const flush = () => {
+      if (!mutationWatch) return;
+      const customClick = mutationWatch.pendingCustomClick;
+      obs.disconnect();
+      clearTimeout(maxTimer);
+      if (settleTimer) clearTimeout(settleTimer);
+      mutationWatch = null;
+
+      const urlChanged = location.href !== startUrl;
+      const domChanged = urlChanged || dialogOrFormChanged || addedNodes + removedNodes >= 2;
+      if (!domChanged) return;
+
+      if (customClick) {
+        emitUserActivity({
+          kind: "click",
+          role: "element",
+          label: customClick,
+          detail: "triggered UI update"
+        });
+      }
+
+      const parts = [];
+      if (urlChanged) parts.push(`URL -> ${location.href}`);
+      if (dialogOrFormChanged) parts.push("form/dialog state changed");
+      if (addedNodes || removedNodes) parts.push(`DOM +${addedNodes}/-${removedNodes} elements`);
+      emitUserActivity({
+        kind: "dom_update",
+        role: "page",
+        label: document.title || location.pathname,
+        detail: parts.join(", ")
+      });
+    };
+
+    const obs = new MutationObserver((records) => {
+      for (const r of records) {
+        if (r.type === "childList") {
+          for (const n of r.addedNodes) {
+            if (n.nodeType === 1) {
+              addedNodes++;
+              const tag = n.tagName?.toLowerCase();
+              if (tag === "dialog" || tag === "form" || n.getAttribute?.("role") === "dialog") dialogOrFormChanged = true;
+            }
+          }
+          for (const n of r.removedNodes) {
+            if (n.nodeType === 1) {
+              removedNodes++;
+              const tag = n.tagName?.toLowerCase();
+              if (tag === "dialog" || tag === "form" || n.getAttribute?.("role") === "dialog") dialogOrFormChanged = true;
+            }
+          }
+        } else if (r.type === "attributes") {
+          dialogOrFormChanged = true;
+        }
+      }
+      if (settleTimer) clearTimeout(settleTimer);
+      settleTimer = setTimeout(flush, 260);
+    });
+
+    if (document.documentElement) {
+      obs.observe(document.documentElement, {
+        childList: true,
+        subtree: true,
+        attributes: true,
+        attributeFilter: ["open", "hidden", "aria-hidden", "aria-expanded"]
+      });
+    }
+    const maxTimer = setTimeout(flush, 1300);
+    mutationWatch = { pendingCustomClick, flush };
+  }
+
+  function installHumanActivityListeners() {
+    if (globalThis.__cextHumanHooked) return;
+    globalThis.__cextHumanHooked = true;
+
+    const onHumanInput = (ev) => {
+      if (!ev.isTrusted || agentBusyDepth > 0) return;
+      const raw = (typeof ev.composedPath === "function" && ev.composedPath()[0]) || ev.target;
+      if (!raw || raw.nodeType !== 1) return;
+      const tag = raw.tagName.toLowerCase();
+      if (tag !== "input" && tag !== "textarea" && tag !== "select" && !raw.isContentEditable) return;
+      emitUserActivity({
+        kind: "input",
+        role: getRole(raw),
+        label: getAccessibleName(raw) || raw.getAttribute("name") || tag,
+        detail: summarizeInputSafe(raw),
+        selector: cssPath(raw)
+      });
+      armPostUserMutationCheck();
+    };
+
+    document.addEventListener("input", onHumanInput, { capture: true, passive: true });
+    document.addEventListener("change", onHumanInput, { capture: true, passive: true });
+
+    document.addEventListener(
+      "click",
+      (ev) => {
+        if (!ev.isTrusted || agentBusyDepth > 0) return;
+        const raw = (typeof ev.composedPath === "function" && ev.composedPath()[0]) || ev.target;
+        if (!raw || raw.nodeType !== 1) return;
+        const inter = findNearestInteractive(raw);
+        if (inter) {
+          const label = getAccessibleName(inter) || inter.tagName.toLowerCase();
+          const typeAttr = (inter.getAttribute("type") || "").toLowerCase();
+          const isSubmitLike = typeAttr === "submit" || SUBMIT_RE.test(label);
+          emitUserActivity({
+            kind: isSubmitLike ? "submit_click" : "click",
+            role: getRole(inter),
+            label,
+            selector: cssPath(inter)
+          });
+          armPostUserMutationCheck();
+        } else {
+          const fallbackLabel = cleanText(raw.innerText || raw.textContent || "", 50);
+          if (fallbackLabel) armPostUserMutationCheck(fallbackLabel);
+        }
+      },
+      { capture: true, passive: true }
+    );
+
+    document.addEventListener(
+      "submit",
+      (ev) => {
+        if (agentBusyDepth > 0) return;
+        const form = ev.target;
+        emitUserActivity({
+          kind: "submit",
+          role: "form",
+          label: (form && form.nodeType === 1 ? getAccessibleName(form) : "") || document.title || "form"
+        });
+        armPostUserMutationCheck();
+      },
+      { capture: true, passive: true }
+    );
+  }
+
+  installHumanActivityListeners();
+
   globalThis.__cext = {
-    version: 1,
+    version: 2,
     async dispatch(method, params = {}) {
-      switch (method) {
-        case "read_page": return readPage(params);
-        case "find": return findElements(params);
-        case "act": return await act(params);
-        case "form_input": return await formInput(params);
-        case "wait_for": return { text: await waitForCondition(params) };
-        case "get_bbox": return getBbox(params);
-        case "set_files": return setFiles(params);
-        default: throw new Error(`Unknown dom-agent method: ${method}`);
+      const isMutating = method === "act" || method === "form_input" || method === "set_files";
+      if (isMutating) agentBusyDepth++;
+      try {
+        switch (method) {
+          case "read_page": return readPage(params);
+          case "find": return findElements(params);
+          case "act": return await act(params);
+          case "form_input": return await formInput(params);
+          case "wait_for": return { text: await waitForCondition(params) };
+          case "get_bbox": return getBbox(params);
+          case "set_files": return setFiles(params);
+          case "ping_human_hook": return { ok: true };
+          default: throw new Error(`Unknown dom-agent method: ${method}`);
+        }
+      } finally {
+        if (isMutating) setTimeout(() => { agentBusyDepth = Math.max(0, agentBusyDepth - 1); }, 80);
       }
     }
   };
