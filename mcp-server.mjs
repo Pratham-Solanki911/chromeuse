@@ -426,7 +426,7 @@ export const TOOLS = [
   {
     name: "tabs",
     description:
-      "List, open, switch/activate, close, reload, navigate back/forward, or group Chrome tabs. Active tab is marked with '*'. Most other tools default to the active tab automatically when tabId is omitted.",
+      "List, open, switch/activate, close, close_agent_tabs, reload, navigate back/forward, or group Chrome tabs. Agent tabs are automatically placed in the 'AI Agent' tab group so the user doesn't click them by mistake. IMPORTANT: Always close tabs you opened once your work is finished (use action:'close' or action:'close_agent_tabs').",
     annotations: { readOnlyHint: false },
     inputSchema: {
       type: "object",
@@ -434,11 +434,11 @@ export const TOOLS = [
       properties: {
         action: {
           type: "string",
-          enum: ["list", "new", "activate", "close", "reload", "back", "forward", "group"],
+          enum: ["list", "new", "activate", "close", "close_agent_tabs", "reload", "back", "forward", "group"],
           default: "list",
-          description: "Tab operation to perform."
+          description: "Tab operation to perform. Use 'close' or 'close_agent_tabs' when done working."
         },
-        tabId: { type: "number", description: "Target tab ID (optional; defaults to active tab)." },
+        tabId: { type: "number", description: "Target tab ID (optional; defaults to the agent's active grouped tab)." },
         tabIds: { type: "array", items: { type: "number" }, description: "Multiple tab IDs for close or group." },
         url: { type: "string", description: "URL to open when action is 'new'." },
         active: { type: "boolean", default: true, description: "Focus the new tab immediately." },
@@ -449,7 +449,7 @@ export const TOOLS = [
   {
     name: "navigate",
     description:
-      "Navigate the active tab (or a specified tabId, or a new tab) to a URL, wait for load, and return an immediate interactive page snapshot with ref IDs.",
+      "Navigate to a URL inside the 'AI Agent' tab group (automatically opens a grouped agent tab instead of overwriting the user's personal tab when starting fresh), wait for load, and return an interactive snapshot. Close tabs you opened via 'tabs' once finished.",
     annotations: { readOnlyHint: false },
     inputSchema: {
       type: "object",
@@ -528,6 +528,7 @@ export const TOOLS = [
         x: { type: "number", description: "Viewport X coordinate." },
         y: { type: "number", description: "Viewport Y coordinate." },
         ms: { type: "number", description: "Wait duration in ms when action='wait'." },
+        force: { type: "boolean", default: false, description: "Run even if user manually interacted since last read_page." },
         returnSnapshot: { type: "boolean", default: false, description: "Return fresh read_page snapshot after action(s)." },
         steps: {
           type: "array",
@@ -566,6 +567,7 @@ export const TOOLS = [
       properties: {
         tabId: { type: "number" },
         submit: { type: "boolean", default: false, description: "Submit the form after filling all fields." },
+        force: { type: "boolean", default: false, description: "Run even if user manually interacted since last read_page." },
         fields: {
           type: "array",
           items: {
@@ -622,7 +624,8 @@ export const TOOLS = [
           description: "Set true only when OS-level CDP input is needed (e.g. Canvas/WebGL apps)."
         },
         accept: { type: "boolean", default: true, description: "Accept or dismiss JS dialog when action='handle_dialog'." },
-        promptText: { type: "string", description: "Prompt input text when action='handle_dialog'." }
+        promptText: { type: "string", description: "Prompt input text when action='handle_dialog'." },
+        force: { type: "boolean", default: false, description: "Run even if user manually interacted since last read_page." }
       }
     }
   },
@@ -732,6 +735,7 @@ export const TOOLS = [
         tabId: { type: "number" },
         ref: { type: "string", description: "Ref ID of the <input type='file'> element." },
         selector: { type: "string", description: "CSS selector of the <input type='file'> element." },
+        force: { type: "boolean", default: false, description: "Run even if user manually interacted since last read_page." },
         filePaths: {
           type: "array",
           items: { type: "string" },
@@ -815,9 +819,9 @@ export function handleJsonRpcMessage(bridge, msg) {
             result: {
               protocolVersion,
               capabilities: { tools: { listChanged: false } },
-              serverInfo: { name: "chrome-use", version: "1.1.0" },
+              serverInfo: { name: "chrome-use", version: "1.2.0" },
               instructions:
-                "Control the user's live Chrome browser silently via ChromeUse (zero remote-debugging prompts). Prefer 'read_page' or 'find' + 'act' (with steps/returnSnapshot) for fast, low-token automation; use 'computer' for screenshots or pixel/canvas coordinates."
+                "Control the user's live Chrome browser silently via ChromeUse (zero remote-debugging prompts). Prefer 'read_page' or 'find' + 'act' (with steps/returnSnapshot) for fast, low-token automation; use 'computer' for screenshots or pixel/canvas coordinates. Agent tabs are isolated in the 'AI Agent' tab group — ALWAYS close tabs you opened once done working (via 'tabs' action:'close' or action:'close_agent_tabs'). If you receive [USER_COMPLETED_AND_TAB_CLOSED] or [USER_INTERACTION_DETECTED], the user manually filled/submitted or updated the page — do NOT treat it as a crash, re-open closed tabs, or re-inject/re-submit already completed forms."
             }
           };
         }
@@ -1175,6 +1179,9 @@ async function runSelfTest() {
       params: { protocolVersion: "2025-03-26" }
     });
     if (initRes.result.serverInfo.name !== "chrome-use") throw new Error("Bad initialize response");
+    if (!initRes.result.instructions.includes("close_agent_tabs") || !initRes.result.instructions.includes("USER_COMPLETED_AND_TAB_CLOSED")) {
+      throw new Error("Missing tab-cleanup or human-activity instructions in initialize");
+    }
 
     const listRes = await handleJsonRpcMessage(leader, { jsonrpc: "2.0", id: 2, method: "tools/list" });
     if (listRes.result.tools.length !== 13) throw new Error(`Expected 13 tools, got ${listRes.result.tools.length}`);

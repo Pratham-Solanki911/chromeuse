@@ -1,11 +1,12 @@
 {
   "manifest_version": 3,
   "name": "ChromeUse",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Universal zero-prompt MCP browser connector for Antigravity, Claude, GPT, Cursor, and any AI model.",
   "permissions": [
     "nativeMessaging",
     "tabs",
+    "tabGroups",
     "scripting",
     "activeTab",
     "cookies",

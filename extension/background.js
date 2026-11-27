@@ -1,17 +1,48 @@
 // ChromeUse MV3 Background Service Worker
 // Connects via Chrome Native Messaging ("com.chromeuse.bridge") — zero TCP/WebSocket calls in Chrome,
-// so net::ERR_CONNECTION_REFUSED can never occur even when the IDE/MCP client is closed.
+// auto-groups agent tabs under "AI Agent", and reports manual user form-fills/clicks/tab-closures to the agent.
 
 const NATIVE_HOST = "com.chromeuse.bridge";
+const AGENT_GROUP_TITLE = "AI Agent";
+const AGENT_GROUP_COLOR = "cyan";
 const MAX_RING = 200; // mytail: 200 network entries per tab ring buffer; raise if profiling heavy SPAs.
 
 let nativePort = null;
 let paused = false;
 let reconnectTimer = null;
 
+// Agent tab ownership & grouping state
+const agentTabs = new Set(); // Set<number>
+let lastAgentTabId = null;
+const agentClosingTabs = new Set();
+const cdpBusyTabs = new Set();
+
+// Human activity ledger per tab & recently closed agent tabs
+// tabId -> { unreadEvents: Array<{ kind, selector, line, ts }>, lastReadTs: number, lastMutatingUserTs: number, lastUrl: string, lastTitle: string }
+const userActivityByTab = new Map();
+// tabId -> { tabId, closedAt, url, title, events: string[], hadUserAction: boolean, reported: boolean }
+const closedAgentTabs = new Map();
+
 // tabId -> Array<{ id, method, url, type, status, durationMs, error, ts }>
 const netLogs = new Map();
 const pendingReq = new Map(); // requestId -> entry
+
+class ClosedTabNoticeSignal extends Error {
+  constructor(noticeText, tabId) {
+    super(noticeText);
+    this.noticeText = noticeText;
+    this.tabId = tabId;
+  }
+}
+
+async function saveAgentSession() {
+  try {
+    await chrome.storage.session.set({
+      agentTabIds: [...agentTabs],
+      lastAgentTabId
+    });
+  } catch {}
+}
 
 async function loadState() {
   try {
@@ -20,6 +51,19 @@ async function loadState() {
   } catch {
     paused = false;
   }
+  try {
+    const sess = await chrome.storage.session.get(["agentTabIds", "lastAgentTabId"]);
+    if (Array.isArray(sess.agentTabIds)) {
+      const openTabs = await chrome.tabs.query({});
+      const openIds = new Set(openTabs.map((t) => t.id));
+      for (const id of sess.agentTabIds) {
+        if (openIds.has(id)) agentTabs.add(id);
+      }
+    }
+    if (sess.lastAgentTabId && agentTabs.has(sess.lastAgentTabId)) {
+      lastAgentTabId = sess.lastAgentTabId;
+    }
+  } catch {}
   updateBadge();
 }
 
@@ -86,13 +130,19 @@ function connectBridge() {
           const result = await handleCommand(msg.cmd, msg.params || {});
           if (nativePort === port) port.postMessage({ id: msg.id, ok: true, result });
         } catch (err) {
+          if (err instanceof ClosedTabNoticeSignal) {
+            if (nativePort === port) {
+              port.postMessage({ id: msg.id, ok: true, result: { tabClosed: true, text: err.noticeText } });
+            }
+            return;
+          }
           if (nativePort === port) port.postMessage({ id: msg.id, ok: false, error: String(err?.message || err) });
         }
       }
     });
 
     port.onDisconnect.addListener(() => {
-      void chrome.runtime.lastError; // consume lastError so Chrome never logs an unchecked error
+      void chrome.runtime.lastError;
       if (nativePort === port) nativePort = null;
       updateBadge();
       if (!paused) scheduleReconnect(2500);
@@ -116,7 +166,6 @@ function disconnectBridge() {
   updateBadge();
 }
 
-// Headless single-click toggle on toolbar icon
 chrome.action.onClicked.addListener(async () => {
   paused = !paused;
   await chrome.storage.local.set({ paused });
@@ -133,6 +182,217 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === "cext_heartbeat" && !paused && !nativePort) {
     connectBridge();
   }
+});
+
+// ---- Human Activity Recording ----
+
+function getOrInitTabActivity(tabId, url = "", title = "") {
+  let st = userActivityByTab.get(tabId);
+  if (!st) {
+    st = {
+      unreadEvents: [],
+      allRecentLines: [],
+      lastReadTs: 0,
+      lastMutatingUserTs: 0,
+      lastUrl: url,
+      lastTitle: title
+    };
+    userActivityByTab.set(tabId, st);
+  }
+  if (url) st.lastUrl = url;
+  if (title) st.lastTitle = title;
+  return st;
+}
+
+function formatUserEventLine(msg) {
+  switch (msg.kind) {
+    case "input":
+      return `User filled ${msg.role || "field"} "${msg.label || "input"}" ${msg.detail || ""}`.trim();
+    case "submit_click":
+      return `User clicked submit control ${msg.role || "button"} "${msg.label || "Submit"}"`;
+    case "click":
+      return `User clicked ${msg.role || "element"} "${msg.label || ""}"${msg.detail ? ` (${msg.detail})` : ""}`;
+    case "submit":
+      return `User submitted form "${msg.label || "form"}"`;
+    case "dom_update":
+      return `Page/component updated after user action (${msg.detail || "DOM changed"})`;
+    default:
+      return `User interacted with page (${msg.kind})`;
+  }
+}
+
+chrome.runtime.onMessage.addListener((msg, sender) => {
+  if (!msg || msg.type !== "cext_user_activity") return false;
+  const tabId = sender?.tab?.id;
+  if (!tabId || cdpBusyTabs.has(tabId)) return false;
+
+  const st = getOrInitTabActivity(tabId, msg.url || sender?.tab?.url, msg.title || sender?.tab?.title);
+  const line = formatUserEventLine(msg);
+  const ts = msg.ts || Date.now();
+
+  // Coalesce rapid keystrokes inside the exact same field within 5s
+  const prev = st.unreadEvents[st.unreadEvents.length - 1];
+  if (msg.kind === "input" && prev && prev.kind === "input" && prev.selector === msg.selector && ts - prev.ts < 5000) {
+    prev.line = line;
+    prev.ts = ts;
+    st.allRecentLines[st.allRecentLines.length - 1] = line;
+  } else {
+    st.unreadEvents.push({ kind: msg.kind, selector: msg.selector || "", line, ts });
+    if (st.unreadEvents.length > 40) st.unreadEvents.shift();
+    st.allRecentLines.push(line);
+    if (st.allRecentLines.length > 25) st.allRecentLines.shift();
+  }
+  st.lastMutatingUserTs = ts;
+  return false;
+});
+
+function buildClosedTabNotice(entry) {
+  entry.reported = true;
+  const ageSec = Math.max(0, Math.round((Date.now() - entry.closedAt) / 1000));
+  if (entry.hadUserAction) {
+    return [
+      `[USER_COMPLETED_AND_TAB_CLOSED] Tab ${entry.tabId} ("${entry.title || "untitled"}", ${entry.url || ""}) closed ${ageSec}s ago AFTER manual user interaction:`,
+      ...entry.events.map((l) => `  - ${l}`),
+      `  - Tab ${entry.tabId} then closed cleanly.`,
+      `IMPORTANT FOR AGENT: This tab did NOT crash. The user manually filled/submitted or completed the flow and the page closed. Do NOT re-open this URL or re-submit the form unless the user explicitly asks.`
+    ].join("\n");
+  }
+  return [
+    `[TAB_CLOSED_BY_USER_OR_PAGE] Tab ${entry.tabId} ("${entry.title || "untitled"}", ${entry.url || ""}) closed ${ageSec}s ago.`,
+    `IMPORTANT FOR AGENT: Do NOT assume the tab crashed or automatically re-open it; check remaining open tabs via 'tabs' if needed.`
+  ].join("\n");
+}
+
+function drainUnreadNoticesForTab(targetTabId) {
+  const blocks = [];
+
+  for (const entry of closedAgentTabs.values()) {
+    if (!entry.reported) {
+      blocks.push(buildClosedTabNotice(entry));
+    }
+  }
+
+  if (targetTabId !== undefined && targetTabId !== null) {
+    const st = userActivityByTab.get(targetTabId);
+    if (st && st.unreadEvents.length > 0) {
+      const lines = st.unreadEvents.splice(0).map((e) => `  - ${e.line}`);
+      st.lastReadTs = Date.now();
+      blocks.push(
+        [
+          `[USER_ACTIVITY_NOTICE on tab ${targetTabId}] The user manually interacted with this page:`,
+          ...lines,
+          `Review the latest page state before repeating any form fill or button click.`
+        ].join("\n")
+      );
+    }
+  }
+
+  return blocks.length ? blocks.join("\n\n") : "";
+}
+
+function markTabReadByAgent(tabId) {
+  const st = getOrInitTabActivity(tabId);
+  st.lastReadTs = Date.now();
+}
+
+// ---- Automatic "AI Agent" Tab Grouping & Lifecycle ----
+
+async function ensureAgentTabGroup(tabOrId) {
+  let tab;
+  try {
+    tab = typeof tabOrId === "number" ? await chrome.tabs.get(tabOrId) : tabOrId;
+  } catch {
+    return null;
+  }
+  if (!tab || !tab.id) return null;
+
+  agentTabs.add(tab.id);
+  lastAgentTabId = tab.id;
+  getOrInitTabActivity(tab.id, tab.url, tab.title);
+  await saveAgentSession();
+
+  // Attach passive human-activity listener on non-restricted pages
+  if (!isRestrictedUrl(tab.url)) {
+    ensureDomAgent(tab.id, 0).catch(() => {});
+  }
+
+  // Never unpin a user's pinned tab; skip non-normal popup windows that forbid tabGroups
+  if (tab.pinned) return tab;
+
+  try {
+    const win = await chrome.windows.get(tab.windowId);
+    if (win && win.type && win.type !== "normal") return tab;
+
+    if (chrome.tabGroups?.query) {
+      const existingGroups = await chrome.tabGroups.query({ windowId: tab.windowId, title: AGENT_GROUP_TITLE });
+      if (existingGroups.length > 0) {
+        const targetGid = existingGroups[0].id;
+        if (tab.groupId !== targetGid) {
+          await chrome.tabs.group({ tabIds: [tab.id], groupId: targetGid });
+        }
+        return tab;
+      }
+    }
+
+    const newGroupId = await chrome.tabs.group({ createProperties: { windowId: tab.windowId }, tabIds: [tab.id] });
+    if (chrome.tabGroups?.update) {
+      await chrome.tabGroups.update(newGroupId, {
+        title: AGENT_GROUP_TITLE,
+        color: AGENT_GROUP_COLOR
+      });
+    }
+  } catch {
+    // Tab may be mid-drag or in a popup window — safe to ignore
+  }
+  return tab;
+}
+
+chrome.tabs.onCreated.addListener((tab) => {
+  if (tab.id && tab.openerTabId && agentTabs.has(tab.openerTabId)) {
+    ensureAgentTabGroup(tab).catch(() => {});
+  }
+});
+
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  if (!agentTabs.has(tabId)) return;
+  const st = getOrInitTabActivity(tabId, tab?.url, tab?.title);
+  if (changeInfo.url) st.lastUrl = changeInfo.url;
+  if (changeInfo.title) st.lastTitle = changeInfo.title;
+  if (changeInfo.status === "complete" && tab?.url && !isRestrictedUrl(tab.url)) {
+    ensureDomAgent(tabId, 0).catch(() => {});
+  }
+});
+
+chrome.tabs.onRemoved.addListener((tabId) => {
+  netLogs.delete(tabId);
+  const wasAgentTab = agentTabs.has(tabId);
+  const st = userActivityByTab.get(tabId);
+  agentTabs.delete(tabId);
+  userActivityByTab.delete(tabId);
+
+  if (wasAgentTab && !agentClosingTabs.has(tabId)) {
+    const recentEvents = st ? st.allRecentLines.slice(-10) : [];
+    closedAgentTabs.set(tabId, {
+      tabId,
+      closedAt: Date.now(),
+      url: st?.lastUrl || "",
+      title: st?.lastTitle || "",
+      events: recentEvents,
+      hadUserAction: recentEvents.length > 0,
+      reported: false
+    });
+    if (closedAgentTabs.size > 30) {
+      const oldest = closedAgentTabs.keys().next().value;
+      closedAgentTabs.delete(oldest);
+    }
+  }
+  agentClosingTabs.delete(tabId);
+
+  if (lastAgentTabId === tabId) {
+    const remaining = [...agentTabs];
+    lastAgentTabId = remaining.length > 0 ? remaining[remaining.length - 1] : null;
+  }
+  saveAgentSession();
 });
 
 // Passive, zero-footprint network tracking per tab
@@ -187,10 +447,6 @@ chrome.webRequest.onErrorOccurred.addListener(
   { urls: ["<all_urls>"] }
 );
 
-chrome.tabs.onRemoved.addListener((tabId) => {
-  netLogs.delete(tabId);
-});
-
 // ---- Helpers for Tab & Script Execution ----
 
 function isRestrictedUrl(url = "") {
@@ -206,14 +462,54 @@ function isRestrictedUrl(url = "") {
   );
 }
 
-async function resolveTab(tabId, { allowCreate = false } = {}) {
+function isBlankNewTabUrl(url = "") {
+  return !url || url === "about:blank" || url.startsWith("chrome://newtab") || url.startsWith("edge://newtab");
+}
+
+async function resolveTab(tabId, { allowCreate = false, preferNewAgentTab = false } = {}) {
   if (tabId !== undefined && tabId !== null) {
-    const t = await chrome.tabs.get(Number(tabId));
-    if (!t) throw new Error(`Tab ${tabId} not found`);
-    return t;
+    const numericId = Number(tabId);
+    try {
+      const t = await chrome.tabs.get(numericId);
+      if (t) return t;
+    } catch {
+      const closed = closedAgentTabs.get(numericId);
+      if (closed) throw new ClosedTabNoticeSignal(buildClosedTabNotice(closed), numericId);
+      throw new Error(`Tab ${numericId} is no longer open. Call 'tabs' to inspect open tabs.`);
+    }
   }
+
+  // Prefer the agent's own grouped tab so user browsing in other tabs is never hijacked
+  if (lastAgentTabId !== null) {
+    try {
+      const agentTab = await chrome.tabs.get(lastAgentTabId);
+      if (agentTab) return agentTab;
+    } catch {
+      const closed = closedAgentTabs.get(lastAgentTabId);
+      lastAgentTabId = null;
+      if (closed && !closed.reported) {
+        throw new ClosedTabNoticeSignal(buildClosedTabNotice(closed), closed.tabId);
+      }
+    }
+  }
+
+  // Check if all agent tabs just closed after user completion before falling back to user's personal tab
+  for (const closed of closedAgentTabs.values()) {
+    if (!closed.reported && closed.hadUserAction && Date.now() - closed.closedAt < 120000) {
+      throw new ClosedTabNoticeSignal(buildClosedTabNotice(closed), closed.tabId);
+    }
+  }
+
   const focused = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
   const normal = focused.find((t) => !t.url?.startsWith("devtools://"));
+
+  if (preferNewAgentTab) {
+    if (normal && isBlankNewTabUrl(normal.url)) return normal;
+    const created = await chrome.tabs.create({ url: "about:blank", active: true });
+    await ensureAgentTabGroup(created);
+    return created;
+  }
+
   if (normal) return normal;
 
   const anyActive = await chrome.tabs.query({ active: true });
@@ -223,7 +519,9 @@ async function resolveTab(tabId, { allowCreate = false } = {}) {
   if (all.length > 0) return all[0];
 
   if (allowCreate) {
-    return await chrome.tabs.create({ url: "about:blank", active: true });
+    const created = await chrome.tabs.create({ url: "about:blank", active: true });
+    await ensureAgentTabGroup(created);
+    return created;
   }
   throw new Error("No open Chrome tabs found. Use navigate with newTab:true or tabs action:'new'.");
 }
@@ -239,7 +537,7 @@ async function ensureDomAgent(tabId, frameId = 0) {
   const check = await chrome.scripting.executeScript({
     target: { tabId, frameIds: [frameId] },
     world: "ISOLATED",
-    func: () => Boolean(globalThis.__cext && globalThis.__cext.version === 1)
+    func: () => Boolean(globalThis.__cext && globalThis.__cext.version >= 2)
   });
   if (!check?.[0]?.result) {
     await chrome.scripting.executeScript({
@@ -251,29 +549,42 @@ async function ensureDomAgent(tabId, frameId = 0) {
 }
 
 async function runDomAgent(tabId, method, params = {}, frameId = 0) {
-  const tab = await chrome.tabs.get(tabId);
+  let tab;
+  try {
+    tab = await chrome.tabs.get(tabId);
+  } catch {
+    const closed = closedAgentTabs.get(tabId);
+    if (closed) throw new ClosedTabNoticeSignal(buildClosedTabNotice(closed), tabId);
+    throw new Error(`Tab ${tabId} closed during '${method}'.`);
+  }
   if (isRestrictedUrl(tab.url)) {
     throw new Error(
       `Tab ${tabId} is on restricted browser URL "${tab.url}". Use 'navigate' to load an http(s) page or switch tabs via 'tabs'.`
     );
   }
-  await ensureDomAgent(tabId, frameId);
-  const injected = await chrome.scripting.executeScript({
-    target: { tabId, frameIds: [frameId] },
-    world: "ISOLATED",
-    func: async (m, p) => {
-      try {
-        return { ok: true, value: await globalThis.__cext.dispatch(m, p) };
-      } catch (e) {
-        return { ok: false, error: String(e?.message || e) };
-      }
-    },
-    args: [method, params]
-  });
-  const res = injected?.[0]?.result;
-  if (!res) throw new Error(`Script execution returned no result on tab ${tabId}`);
-  if (!res.ok) throw new Error(res.error);
-  return res.value;
+  try {
+    await ensureDomAgent(tabId, frameId);
+    const injected = await chrome.scripting.executeScript({
+      target: { tabId, frameIds: [frameId] },
+      world: "ISOLATED",
+      func: async (m, p) => {
+        try {
+          return { ok: true, value: await globalThis.__cext.dispatch(m, p) };
+        } catch (e) {
+          return { ok: false, error: String(e?.message || e) };
+        }
+      },
+      args: [method, params]
+    });
+    const res = injected?.[0]?.result;
+    if (!res) throw new Error(`Script execution returned no result on tab ${tabId}`);
+    if (!res.ok) throw new Error(res.error);
+    return res.value;
+  } catch (err) {
+    const closed = closedAgentTabs.get(tabId);
+    if (closed) throw new ClosedTabNoticeSignal(buildClosedTabNotice(closed), tabId);
+    throw err;
+  }
 }
 
 async function ensureConsoleHook(tabId) {
@@ -308,78 +619,154 @@ async function ensureConsoleHook(tabId) {
         window.addEventListener("unhandledrejection", (e) => push("unhandledrejection", [e.reason || "Unhandled rejection"]));
       }
     });
-  } catch {
-    // Ignore on restricted pages
-  }
+  } catch {}
 }
 
 async function waitForTabLoad(tabId, waitUntil = "load", timeoutMs = 15000) {
   if (waitUntil === "none") return;
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
-    const t = await chrome.tabs.get(tabId);
+    let t;
+    try {
+      t = await chrome.tabs.get(tabId);
+    } catch {
+      const closed = closedAgentTabs.get(tabId);
+      if (closed) throw new ClosedTabNoticeSignal(buildClosedTabNotice(closed), tabId);
+      return;
+    }
     if (t.status === "complete") return;
-    if (waitUntil === "domcontentloaded" && t.status === "complete") return;
     await new Promise((r) => setTimeout(r, 120));
   }
 }
 
 async function withDebugger(tabId, fn) {
   const target = { tabId };
+  cdpBusyTabs.add(tabId);
   await chrome.debugger.attach(target, "1.3");
   try {
     return await fn((method, commandParams = {}) => chrome.debugger.sendCommand(target, method, commandParams));
   } finally {
     try { await chrome.debugger.detach(target); } catch {}
+    setTimeout(() => cdpBusyTabs.delete(tabId), 120);
   }
+}
+
+function isMutatingActCall(params = {}) {
+  const steps = Array.isArray(params.steps) && params.steps.length > 0 ? params.steps : [params];
+  return steps.some((s) => s.action && s.action !== "wait" && s.action !== "scroll");
+}
+
+async function checkStaleHumanGuard(tabId, force = false) {
+  if (force) return null;
+  const st = userActivityByTab.get(tabId);
+  if (!st || st.unreadEvents.length === 0 || st.lastMutatingUserTs <= st.lastReadTs) return null;
+
+  const lines = st.unreadEvents.splice(0).map((e) => `  - ${e.line}`);
+  st.lastReadTs = Date.now();
+
+  let liveSnap = "";
+  try {
+    const snap = await runDomAgent(tabId, "read_page", { mode: "interactive", maxChars: 14000 }, 0);
+    liveSnap = `\n\nCurrent live page snapshot ([tab ${tabId}]):\n${snap.text}`;
+  } catch {}
+
+  return {
+    skippedDueToUserActivity: true,
+    text: [
+      `[USER_INTERACTION_DETECTED — PENDING ACTION SKIPPED]`,
+      `The user manually interacted with [tab ${tabId}] since your last page read:`,
+      ...lines,
+      `Your action was skipped to prevent overwriting user input, injecting into the wrong field, or double-submitting.`,
+      `Inspect the updated page state below — if the user already finished/submitted this step, proceed without repeating it (pass force:true only if you still intentionally want to run the action).${liveSnap}`
+    ].join("\n")
+  };
+}
+
+function attachUnreadPrefix(tabId, resultObj) {
+  const prefix = drainUnreadNoticesForTab(tabId);
+  if (prefix && resultObj && typeof resultObj.text === "string") {
+    resultObj.text = `${prefix}\n\n${resultObj.text}`;
+  }
+  return resultObj;
 }
 
 // ---- Command Router ----
 
 async function handleCommand(cmd, params) {
   switch (cmd) {
-    case "tabs":
-      return await cmdTabs(params);
-    case "navigate":
-      return await cmdNavigate(params);
-    case "read_page":
-      return await cmdReadPage(params);
-    case "find":
-      return await cmdFind(params);
+    case "tabs": {
+      const res = await cmdTabs(params);
+      return attachUnreadPrefix(null, res);
+    }
+    case "navigate": {
+      const res = await cmdNavigate(params);
+      return attachUnreadPrefix(res.tabId, res);
+    }
+    case "read_page": {
+      const res = await cmdReadPage(params);
+      return attachUnreadPrefix(res.tabId, res);
+    }
+    case "find": {
+      const res = await cmdFind(params);
+      return attachUnreadPrefix(res.tabId, res);
+    }
     case "act": {
       const tab = await resolveTab(params.tabId);
+      await ensureAgentTabGroup(tab);
       await ensureConsoleHook(tab.id);
+      if (isMutatingActCall(params)) {
+        const guarded = await checkStaleHumanGuard(tab.id, Boolean(params.force));
+        if (guarded) return guarded;
+      }
       const firstRef = params.ref ?? params.steps?.[0]?.ref;
       const frameId = parseFrameFromRef(firstRef);
-      return await runDomAgent(tab.id, "act", params, frameId);
+      const res = await runDomAgent(tab.id, "act", params, frameId);
+      if (params.returnSnapshot) markTabReadByAgent(tab.id);
+      return attachUnreadPrefix(tab.id, res);
     }
     case "form_input": {
       const tab = await resolveTab(params.tabId);
+      await ensureAgentTabGroup(tab);
       await ensureConsoleHook(tab.id);
+      const guarded = await checkStaleHumanGuard(tab.id, Boolean(params.force));
+      if (guarded) return guarded;
       const firstRef = params.fields?.[0]?.ref;
       const frameId = parseFrameFromRef(firstRef);
-      return await runDomAgent(tab.id, "form_input", params, frameId);
+      const res = await runDomAgent(tab.id, "form_input", params, frameId);
+      return attachUnreadPrefix(tab.id, res);
     }
     case "wait_for": {
       const tab = await resolveTab(params.tabId);
+      await ensureAgentTabGroup(tab);
       if (params.loadComplete) {
         await waitForTabLoad(tab.id, "load", params.timeoutMs || 15000);
-        return { text: `Tab ${tab.id} load complete (${tab.url})` };
+        return attachUnreadPrefix(tab.id, { text: `Tab ${tab.id} load complete (${tab.url})` });
       }
-      return await runDomAgent(tab.id, "wait_for", params, 0);
+      const res = await runDomAgent(tab.id, "wait_for", params, 0);
+      return attachUnreadPrefix(tab.id, res);
     }
-    case "computer":
-      return await cmdComputer(params);
-    case "evaluate":
-      return await cmdEvaluate(params);
+    case "computer": {
+      const res = await cmdComputer(params);
+      return attachUnreadPrefix(res.tabId, res);
+    }
+    case "evaluate": {
+      const res = await cmdEvaluate(params);
+      return attachUnreadPrefix(res.tabId, res);
+    }
     case "console_logs":
       return await cmdConsoleLogs(params);
     case "network_requests":
       return await cmdNetworkRequests(params);
     case "cookies":
       return await cmdCookies(params);
-    case "upload_file":
-      return await cmdUploadFile(params);
+    case "upload_file": {
+      const tab = await resolveTab(params.tabId);
+      await ensureAgentTabGroup(tab);
+      const guarded = await checkStaleHumanGuard(tab.id, Boolean(params.force));
+      if (guarded) return guarded;
+      const res = await cmdUploadFile({ ...params, tabId: tab.id });
+      return attachUnreadPrefix(tab.id, res);
+    }
     default:
       throw new Error(`Unknown command: ${cmd}`);
   }
@@ -392,29 +779,47 @@ async function cmdTabs({ action = "list", tabId, url = "about:blank", active = t
       const focusedWin = await chrome.windows.getLastFocused().catch(() => null);
       const lines = all.map((t) => {
         const isCurrent = t.active && (!focusedWin || t.windowId === focusedWin.id);
-        return `${isCurrent ? "* " : "  "}[tab ${t.id}] (win ${t.windowId}${t.pinned ? ", pinned" : ""}${t.audible ? ", audible" : ""}) "${t.title || ""}" — ${t.url || ""}`;
+        const agentTag = agentTabs.has(t.id) ? ` [${AGENT_GROUP_TITLE}]` : "";
+        return `${isCurrent ? "* " : "  "}[tab ${t.id}]${agentTag} (win ${t.windowId}${t.pinned ? ", pinned" : ""}${t.audible ? ", audible" : ""}) "${t.title || ""}" — ${t.url || ""}`;
       });
+      const reminder = agentTabs.size > 0
+        ? `\n\nReminder: ${agentTabs.size} [${AGENT_GROUP_TITLE}] tab(s) open (${[...agentTabs].join(", ")}). Close tabs you opened once your work on them is done (tabs action:"close" or action:"close_agent_tabs").`
+        : "";
       return {
-        tabs: all.map((t) => ({ id: t.id, windowId: t.windowId, active: t.active, title: t.title, url: t.url, status: t.status })),
-        text: `Open tabs (${all.length}):\n${lines.join("\n")}`
+        tabs: all.map((t) => ({ id: t.id, windowId: t.windowId, active: t.active, isAgentTab: agentTabs.has(t.id), title: t.title, url: t.url, status: t.status })),
+        text: `Open tabs (${all.length}):\n${lines.join("\n")}${reminder}`
       };
     }
     case "new": {
       const created = await chrome.tabs.create({ url, active });
+      await ensureAgentTabGroup(created);
       if (url && url !== "about:blank") await waitForTabLoad(created.id, "load", 12000);
       const updated = await chrome.tabs.get(created.id);
-      return { tabId: updated.id, text: `Opened [tab ${updated.id}] "${updated.title || ""}" — ${updated.url}` };
+      markTabReadByAgent(updated.id);
+      return {
+        tabId: updated.id,
+        text: `Opened [tab ${updated.id}] in "${AGENT_GROUP_TITLE}" group: "${updated.title || ""}" — ${updated.url}\n(Remember to close this tab via tabs action:"close" once your task is done.)`
+      };
     }
     case "activate": {
       const t = await resolveTab(tabId);
+      await ensureAgentTabGroup(t);
       await chrome.tabs.update(t.id, { active: true });
       await chrome.windows.update(t.windowId, { focused: true }).catch(() => {});
-      return { tabId: t.id, text: `Activated [tab ${t.id}] "${t.title || ""}" — ${t.url}` };
+      return { tabId: t.id, text: `Activated [tab ${t.id}] in "${AGENT_GROUP_TITLE}" group: "${t.title || ""}" — ${t.url}` };
     }
     case "close": {
       const ids = Array.isArray(tabIds) && tabIds.length ? tabIds.map(Number) : [(await resolveTab(tabId)).id];
+      for (const id of ids) agentClosingTabs.add(id);
       await chrome.tabs.remove(ids);
       return { text: `Closed tab(s): ${ids.join(", ")}` };
+    }
+    case "close_agent_tabs": {
+      const ids = [...agentTabs];
+      if (!ids.length) return { text: `No open "${AGENT_GROUP_TITLE}" tabs to close.` };
+      for (const id of ids) agentClosingTabs.add(id);
+      await chrome.tabs.remove(ids);
+      return { text: `Closed all ${ids.length} "${AGENT_GROUP_TITLE}" tab(s): ${ids.join(", ")}` };
     }
     case "reload": {
       const t = await resolveTab(tabId);
@@ -438,11 +843,14 @@ async function cmdTabs({ action = "list", tabId, url = "about:blank", active = t
     }
     case "group": {
       const ids = Array.isArray(tabIds) && tabIds.length ? tabIds.map(Number) : [(await resolveTab(tabId)).id];
+      const title = groupTitle || AGENT_GROUP_TITLE;
       const groupId = await chrome.tabs.group({ tabIds: ids });
-      if (groupTitle && chrome.tabGroups?.update) {
-        await chrome.tabGroups.update(groupId, { title: groupTitle }).catch(() => {});
+      if (chrome.tabGroups?.update) {
+        await chrome.tabGroups.update(groupId, { title, color: AGENT_GROUP_COLOR }).catch(() => {});
       }
-      return { text: `Grouped tabs [${ids.join(", ")}]${groupTitle ? ` under "${groupTitle}"` : ""}` };
+      for (const id of ids) agentTabs.add(id);
+      await saveAgentSession();
+      return { text: `Grouped tabs [${ids.join(", ")}] under "${title}"` };
     }
     default:
       throw new Error(`Unsupported tabs action: ${action}`);
@@ -456,9 +864,11 @@ async function cmdNavigate({ url, tabId, newTab = false, waitUntil = "load", tim
   let tab;
   if (newTab) {
     tab = await chrome.tabs.create({ url: normalizedUrl, active: true });
+    await ensureAgentTabGroup(tab);
   } else {
-    tab = await resolveTab(tabId, { allowCreate: true });
+    tab = await resolveTab(tabId, { allowCreate: true, preferNewAgentTab: tabId === undefined || tabId === null });
     tab = await chrome.tabs.update(tab.id, { url: normalizedUrl });
+    await ensureAgentTabGroup(tab);
   }
 
   await waitForTabLoad(tab.id, waitUntil, timeoutMs);
@@ -470,23 +880,28 @@ async function cmdNavigate({ url, tabId, newTab = false, waitUntil = "load", tim
     try {
       const page = await cmdReadPage({ tabId: finalTab.id, mode: "interactive", maxChars: 16000 });
       snap = `\n\n${page.text}`;
-    } catch {
-      // Page might still be redirecting
-    }
+    } catch {}
+  } else {
+    markTabReadByAgent(finalTab.id);
   }
   return {
     tabId: finalTab.id,
-    text: `Navigated [tab ${finalTab.id}] to ${finalTab.url}${snap}`
+    text: `Navigated [tab ${finalTab.id}] (group: "${AGENT_GROUP_TITLE}") to ${finalTab.url}${snap}\n\n(Reminder: Close agent tabs via tabs action:"close" or action:"close_agent_tabs" once finished.)`
   };
 }
 
 async function cmdReadPage(params = {}) {
   const tab = await resolveTab(params.tabId);
+  if (params.tabId !== undefined && params.tabId !== null) {
+    await ensureAgentTabGroup(tab);
+  } else if (agentTabs.has(tab.id)) {
+    await ensureAgentTabGroup(tab);
+  }
   await ensureConsoleHook(tab.id);
   const topRes = await runDomAgent(tab.id, "read_page", params, 0);
+  markTabReadByAgent(tab.id);
   let combined = `[tab ${tab.id}] ${topRes.text}`;
 
-  // Automatically inspect visible cross-origin iframes if present and not scoped to a specific ref
   if (topRes.crossOriginFrames?.length > 0 && !params.rootRef && !params.selector && params.mode !== "markdown") {
     try {
       const frames = await chrome.scripting.executeScript({
@@ -504,23 +919,28 @@ async function cmdReadPage(params = {}) {
             f.frameId
           );
           if (sub?.text) combined += `\n\n${sub.text}`;
-        } catch { /* subframe restricted */ }
+        } catch {}
       }
-    } catch { /* ignore */ }
+    } catch {}
   }
 
-  return { text: combined };
+  return { tabId: tab.id, text: combined };
 }
 
 async function cmdFind(params = {}) {
   const tab = await resolveTab(params.tabId);
+  if (agentTabs.has(tab.id)) await ensureAgentTabGroup(tab);
   const top = await runDomAgent(tab.id, "find", params, 0);
-  return { text: `[tab ${tab.id}] ${top.text}` };
+  markTabReadByAgent(tab.id);
+  return { tabId: tab.id, text: `[tab ${tab.id}] ${top.text}` };
 }
 
 async function cmdComputer(params = {}) {
   const { action = "screenshot" } = params;
   const tab = await resolveTab(params.tabId);
+  if (action !== "screenshot" || agentTabs.has(tab.id)) {
+    await ensureAgentTabGroup(tab);
+  }
 
   if (action === "screenshot") {
     await ensureOffscreen();
@@ -555,7 +975,7 @@ async function cmdComputer(params = {}) {
             viewportHeight = vp[0].result.h;
           }
         }
-      } catch { /* fallback to raw tab dimensions */ }
+      } catch {}
     }
 
     const rawDataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: "png" });
@@ -574,8 +994,10 @@ async function cmdComputer(params = {}) {
     if (!processed?.ok) {
       throw new Error(processed?.error || "Image processing failed");
     }
+    markTabReadByAgent(tab.id);
 
     return {
+      tabId: tab.id,
       image: {
         base64: processed.base64,
         mimeType: processed.mimeType,
@@ -587,6 +1009,9 @@ async function cmdComputer(params = {}) {
     };
   }
 
+  const guarded = await checkStaleHumanGuard(tab.id, Boolean(params.force));
+  if (guarded) return { tabId: tab.id, ...guarded };
+
   if (action === "handle_dialog") {
     return await withDebugger(tab.id, async (cdp) => {
       await cdp("Page.enable");
@@ -594,11 +1019,10 @@ async function cmdComputer(params = {}) {
         accept: params.accept !== false,
         promptText: params.promptText
       });
-      return { text: `Handled JavaScript dialog (accept=${params.accept !== false})` };
+      return { tabId: tab.id, text: `Handled JavaScript dialog (accept=${params.accept !== false})` };
     });
   }
 
-  // Drag or explicit trusted OS-level CDP input (for Canvas / WebGL / cross-origin widgets)
   if (action === "drag" || params.trusted) {
     return await withDebugger(tab.id, async (cdp) => {
       const x = Number(params.x ?? params.startX ?? 0);
@@ -619,7 +1043,7 @@ async function cmdComputer(params = {}) {
           });
         }
         await cdp("Input.dispatchMouseEvent", { type: "mouseReleased", x: endX, y: endY, button: "left", clickCount: 1 });
-        return { text: `Dragged (${x},${y}) -> (${endX},${endY})` };
+        return { tabId: tab.id, text: `Dragged (${x},${y}) -> (${endX},${endY})` };
       }
 
       const btn = action === "right_click" ? "right" : action === "middle_click" ? "middle" : "left";
@@ -631,13 +1055,12 @@ async function cmdComputer(params = {}) {
           await cdp("Input.dispatchMouseEvent", { type: "mouseReleased", x, y, button: btn, clickCount: c });
         }
       }
-      return { text: `Trusted ${action} at (${x}, ${y})` };
+      return { tabId: tab.id, text: `Trusted ${action} at (${x}, ${y})` };
     });
   }
 
-  // Silent DOM coordinate dispatch (zero debugger banner)
   const mappedAction = action === "left_click" ? "click" : action;
-  return await runDomAgent(tab.id, "act", {
+  const res = await runDomAgent(tab.id, "act", {
     action: mappedAction,
     x: params.x,
     y: params.y,
@@ -646,11 +1069,13 @@ async function cmdComputer(params = {}) {
     key: params.key,
     value: params.text ?? params.value
   });
+  return { tabId: tab.id, ...res };
 }
 
 async function cmdEvaluate({ expression, args = [], tabId, world = "MAIN" } = {}) {
   if (!expression) throw new Error("expression is required");
   const tab = await resolveTab(tabId);
+  await ensureAgentTabGroup(tab);
   if (isRestrictedUrl(tab.url)) {
     throw new Error(`Cannot evaluate JS on restricted URL "${tab.url}"`);
   }
@@ -680,10 +1105,9 @@ async function cmdEvaluate({ expression, args = [], tabId, world = "MAIN" } = {}
   const res = injected?.[0]?.result;
   if (res?.ok) {
     const formatted = typeof res.value === "string" ? res.value : JSON.stringify(res.value, null, 2);
-    return { value: res.value, text: formatted ?? "null" };
+    return { tabId: tab.id, value: res.value, text: formatted ?? "null" };
   }
 
-  // Automatic fallback for strict-CSP sites (e.g. GitHub) that disallow unsafe-eval in MAIN world
   if (res?.isCspEval && execWorld === "MAIN") {
     return await withDebugger(tab.id, async (cdp) => {
       const serializedArgs = JSON.stringify(Array.isArray(args) ? args : [args]);
@@ -697,7 +1121,7 @@ async function cmdEvaluate({ expression, args = [], tabId, world = "MAIN" } = {}
         throw new Error(evalRes.exceptionDetails.exception?.description || evalRes.exceptionDetails.text || "Evaluation failed");
       }
       const val = evalRes?.result?.value;
-      return { value: val, text: typeof val === "string" ? val : JSON.stringify(val, null, 2) ?? String(evalRes?.result?.description || "undefined") };
+      return { tabId: tab.id, value: val, text: typeof val === "string" ? val : JSON.stringify(val, null, 2) ?? String(evalRes?.result?.description || "undefined") };
     });
   }
 
@@ -815,7 +1239,6 @@ async function cmdUploadFile({ tabId, ref, selector, files = [], filePaths = [] 
     return await runDomAgent(tab.id, "set_files", { ref, selector, files }, frameId);
   }
   if (filePaths.length > 0) {
-    // Large local file fallback via CDP DOM.setFileInputFiles
     return await withDebugger(tab.id, async (cdp) => {
       const { root } = await cdp("DOM.getDocument", { depth: 1 });
       if (!selector) throw new Error("selector is required when uploading large files via CDP path mode");
@@ -828,7 +1251,6 @@ async function cmdUploadFile({ tabId, ref, selector, files = [], filePaths = [] 
   throw new Error("No files provided to upload_file");
 }
 
-// Startup initialization
 (async () => {
   await loadState();
   if (!paused) connectBridge();
